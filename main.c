@@ -16,8 +16,10 @@
 
 #define MOLD_HEADER_SIZE 20
 #define MOLD_BODY_SIZE   1452
+#define MOLD_SESSION_LEN 10
+#define MOLD_SEGMENTS    3 // SESSION, SEQ NO, BODY
 
-#define MAX_MESSAGES 1
+#define MAX_PACKETS 128
 
 #define handle_error(msg) \
     do { perror(msg); exit(EXIT_FAILURE); } while (0)
@@ -33,10 +35,6 @@ span_t advance(span_t span, size_t offset) {
         .ptr = (void*)((char*)span.ptr + offset), 
         .length = span.length - offset
     };
-}
-
-span_t subspan(span_t span, size_t length) {
-    return (span_t){.ptr = span.ptr, .length = length};
 }
 
 int main(int argsc, char** argsv) {
@@ -97,37 +95,37 @@ int main(int argsc, char** argsv) {
     size_t   mold_packet_size_bytes      = 0;
     span_t   mold_span = map_ptr;
 
-    char session[10] = "TESTSESS";
-    char mold_packet_sequence_headers[MAX_MESSAGES][10];
+    char session[MOLD_SESSION_LEN] = "TESTSESS";
+    char mold_packet_sequence_headers[MAX_PACKETS][10];
 
-    struct iovec   vectors[MAX_MESSAGES * 3];
-    struct mmsghdr messages[MAX_MESSAGES];
+    struct iovec   vectors[MAX_PACKETS * MOLD_SEGMENTS];
+    struct mmsghdr messages[MAX_PACKETS];
 
-    for (size_t i = 0; i < MAX_MESSAGES; ++i) {
-        vectors[3 * i] = (struct iovec) {
+    for (size_t i = 0; i < MAX_PACKETS; ++i) {
+        vectors[MOLD_SEGMENTS * i] = (struct iovec) {
             .iov_base = (void*)session,
             .iov_len  = sizeof session,
         };
-        vectors[3 * i + 1] = (struct iovec) {
+        vectors[MOLD_SEGMENTS * i + 1] = (struct iovec) {
             .iov_base = (void*)(mold_packet_sequence_headers[i]),
-            .iov_len  = 10,
+            .iov_len  = MOLD_SESSION_LEN,
         };
 
-        messages[i] = (struct mmsghdr){
-            .msg_hdr = (struct msghdr){
+        messages[i] = (struct mmsghdr) {
+            .msg_hdr = (struct msghdr) {
                 .msg_name    = &server_addr,
                 .msg_namelen = sizeof server_addr,
-                .msg_iov     = vectors + i * 3,
-                .msg_iovlen  = 3
+                .msg_iov     = vectors + i * MOLD_SEGMENTS,
+                .msg_iovlen  = MOLD_SEGMENTS
             },
         };
     }
 
     for (;;) {
-        unsigned p = 0;
-        while (p < MAX_MESSAGES) {
+        unsigned packets = 0;
+        while (packets < MAX_PACKETS) {
             uint16_t message_size_no;
-            memmove(&message_size_no, map_ptr.ptr, 2);
+            memmove(&message_size_no, map_ptr.ptr, sizeof message_size_no);
             size_t message_size_bytes = ntohs(message_size_no) + sizeof message_size_no;
             map_ptr = advance(map_ptr, message_size_bytes); 
 
@@ -138,27 +136,20 @@ int main(int argsc, char** argsv) {
                 uint16_t mold_packet_message_count_no = htons(mold_packet_message_count);
 
                 memcpy(
-                    (void*)(mold_packet_sequence_headers[p]),
+                    (void*)(mold_packet_sequence_headers[packets]),
                     (void*)&mold_packet_sequence_number_no, 
-                    8
+                    sizeof mold_packet_sequence_number_no
                 );
                 memcpy(
-                    (void*)(mold_packet_sequence_headers[p] + 8),
+                    (void*)(mold_packet_sequence_headers[packets] + sizeof mold_packet_sequence_number_no),
                     (void*)&mold_packet_message_count_no, 
-                    2
+                    sizeof mold_packet_message_count_no
                 );
 
-                vectors[p * 3 + 2] = (struct iovec) {
+                vectors[MOLD_SEGMENTS * packets + 2] = (struct iovec) {
                     .iov_base = mold_span.ptr,
                     .iov_len  = mold_packet_size_bytes,
                 };
-
-                printf(
-                    "New packet [%zu + %u): %zu bytes\n",
-                    mold_packet_sequence_number,
-                    mold_packet_message_count,
-                    mold_packet_size_bytes
-                );
 
                 mold_span = advance(mold_span, mold_packet_size_bytes);
                 mold_packet_sequence_number += (uint64_t)mold_packet_message_count;
@@ -166,17 +157,15 @@ int main(int argsc, char** argsv) {
                 mold_packet_size_bytes = message_size_bytes;
             }
 
-            ++p;
+            ++packets;
             ++mold_packet_message_count;
         }
 
-        if (sendmmsg(socket_fd, messages, p, 0) == -1) handle_error("send");
+        if (sendmmsg(socket_fd, messages, packets, 0) == -1) handle_error("send");
     }
 
     close(socket_fd);
-
     munmap(map.ptr, map.length);
 
     return 0;
 }
-
